@@ -1,0 +1,6 @@
+{
+  "name": "PDF Manager",
+  "description": "A powerful, clean, and modern PDF Document Manager featuring category filtering, customized tags, bookmarking, and local visual reading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
