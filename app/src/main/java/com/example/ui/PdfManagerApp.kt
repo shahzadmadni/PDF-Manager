@@ -7,8 +7,20 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.widget.Toast
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
+import android.content.Intent
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.res.painterResource
+import com.example.R
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -89,15 +101,124 @@ fun PdfManagerApp(viewModel: PdfViewModel) {
     val activeReadingDoc by viewModel.activeReadingDocument.collectAsStateWithLifecycle()
     val editingDoc by viewModel.editingDocument.collectAsStateWithLifecycle()
 
-    // Determine tablet layout configuration (expanded width)
+    // Automatic storage scanner state
+    val isScanningStorage by viewModel.isScanningStorage.collectAsStateWithLifecycle()
+    val scanMessage by viewModel.scanMessage.collectAsStateWithLifecycle()
+
+    // Responsive layout breakpoint: expanded screen (tablets, foldables unfolded, wide landscape)
     val configuration = LocalConfiguration.current
-    val isTablet = configuration.screenWidthDp >= 600
+    val isTablet = configuration.screenWidthDp >= 720
+
+    // Full storage access state across all Android versions
+    var hasFullStorageAccess by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                ContextCompat.checkSelfPermission(
+                    context,
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        )
+    }
+
+    val storagePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.READ_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        hasFullStorageAccess = granted
+        viewModel.scanDeviceStorage()
+    }
+
+    val requestStorageAccess: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                }
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    context.startActivity(intent)
+                } catch (e2: Exception) {
+                    Toast.makeText(context, "Please allow storage access in Settings", Toast.LENGTH_LONG).show()
+                }
+            }
+        } else {
+            storagePermissionLauncher.launch(
+                arrayOf(
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+                )
+            )
+        }
+    }
+
+    // Lifecycle observer to detect when user returns after granting storage permission in Settings
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val current = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Environment.isExternalStorageManager()
+                } else {
+                    ContextCompat.checkSelfPermission(
+                        context,
+                        android.Manifest.permission.READ_EXTERNAL_STORAGE
+                    ) == PackageManager.PERMISSION_GRANTED
+                }
+                hasFullStorageAccess = current
+                if (current) {
+                    viewModel.scanDeviceStorage()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasFullStorageAccess && Build.VERSION.SDK_INT <= 32) {
+            storagePermissionLauncher.launch(
+                arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            )
+        }
+        // Always scan device storage to discover all PDFs
+        viewModel.scanDeviceStorage()
+    }
+
+    LaunchedEffect(scanMessage) {
+        scanMessage?.let {
+            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+            viewModel.clearScanMessage()
+        }
+    }
 
     // Tab Navigation State: Home, Files, Shared, Settings
     var activeTab by rememberSaveable { mutableStateOf("Home") }
 
     // Selected folder for Files explorer tab
     var selectedFolderCategory by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Hardware/System back navigation handler
+    BackHandler(enabled = activeReadingDoc != null || editingDoc != null || activeTab != "Home") {
+        when {
+            activeReadingDoc != null -> viewModel.openDocumentForReading(null)
+            editingDoc != null -> viewModel.openDocumentForEditing(null)
+            activeTab != "Home" -> activeTab = "Home"
+        }
+    }
 
     // SAF Document Picker Launcher
     val pdfPickerLauncher = rememberLauncherForActivityResult(
@@ -238,7 +359,12 @@ fun PdfManagerApp(viewModel: PdfViewModel) {
                                     onScanToolClick = { showScanInstructions = true },
                                     onMergeToolClick = { showMergeWizard = true },
                                     onCompressToolClick = { showCompressDialog = true },
-                                    onProtectToolClick = { showProtectDialog = true }
+                                    onProtectToolClick = { showProtectDialog = true },
+                                    isScanningStorage = isScanningStorage,
+                                    onScanStorageClick = { viewModel.scanDeviceStorage() },
+                                    onImportClick = { pdfPickerLauncher.launch("application/pdf") },
+                                    hasFullStorageAccess = hasFullStorageAccess,
+                                    onRequestStorageAccess = requestStorageAccess
                                 )
                             }
                             "Files" -> {
@@ -267,7 +393,11 @@ fun PdfManagerApp(viewModel: PdfViewModel) {
                                 )
                             }
                             "Settings" -> {
-                                SettingsScreenPane(pdfList = pdfList, context = context)
+                                SettingsScreenPane(
+                                    pdfList = pdfList,
+                                    context = context,
+                                    onScanStorage = { viewModel.scanDeviceStorage() }
+                                )
                             }
                         }
                     }
@@ -334,7 +464,12 @@ fun PdfManagerApp(viewModel: PdfViewModel) {
                                 onScanToolClick = { showScanInstructions = true },
                                 onMergeToolClick = { showMergeWizard = true },
                                 onCompressToolClick = { showCompressDialog = true },
-                                onProtectToolClick = { showProtectDialog = true }
+                                onProtectToolClick = { showProtectDialog = true },
+                                isScanningStorage = isScanningStorage,
+                                onScanStorageClick = { viewModel.scanDeviceStorage() },
+                                onImportClick = { pdfPickerLauncher.launch("application/pdf") },
+                                hasFullStorageAccess = hasFullStorageAccess,
+                                onRequestStorageAccess = requestStorageAccess
                             )
                         }
                         "Files" -> {
@@ -363,7 +498,11 @@ fun PdfManagerApp(viewModel: PdfViewModel) {
                             )
                         }
                         "Settings" -> {
-                            SettingsScreenPane(pdfList = pdfList, context = context)
+                            SettingsScreenPane(
+                                pdfList = pdfList,
+                                context = context,
+                                onScanStorage = { viewModel.scanDeviceStorage() }
+                            )
                         }
                     }
 
@@ -1036,46 +1175,129 @@ fun MainTabletDashboard(
     onScanToolClick: () -> Unit,
     onMergeToolClick: () -> Unit,
     onCompressToolClick: () -> Unit,
-    onProtectToolClick: () -> Unit
+    onProtectToolClick: () -> Unit,
+    isScanningStorage: Boolean,
+    onScanStorageClick: () -> Unit,
+    onImportClick: () -> Unit,
+    hasFullStorageAccess: Boolean = true,
+    onRequestStorageAccess: () -> Unit = {}
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .testTag("pdf_dashboard_list")
     ) {
-        // Sleek Mockup Header Row
+        // Sleek Branded Header Row with Real Logo
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, top = 22.dp, bottom = 12.dp),
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "PDF Manager",
-                fontSize = 25.sp,
-                fontWeight = FontWeight.Medium,
-                fontFamily = FontFamily.SansSerif,
-                letterSpacing = (-0.5).sp,
-                color = Color(0xFF1A1C1E)
-            )
-
-            // Sleek Avatar icon box
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFFD3E4FF))
-                    .clickable { onProfileClick() }
-                    .shadow(1.dp, CircleShape),
-                contentAlignment = Alignment.Center
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Person,
-                    contentDescription = "Profile Avatar Options Tracker",
-                    tint = Color(0xFF001C38),
-                    modifier = Modifier.size(22.dp)
+                // Actual Brand Logo Image (Blue circular badge)
+                Image(
+                    painter = painterResource(id = R.drawable.ic_app_logo),
+                    contentDescription = "PDF Manager Logo",
+                    modifier = Modifier
+                        .size(46.dp)
+                        .shadow(2.dp, CircleShape)
+                        .testTag("app_brand_logo")
                 )
+
+                Column {
+                    Text(
+                        text = "PDF Manager",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.SansSerif,
+                        letterSpacing = (-0.5).sp,
+                        color = Color(0xFF1A1C1E)
+                    )
+                    Text(
+                        text = "Smart Document Hub",
+                        fontSize = 11.sp,
+                        color = Color(0xFF74777F),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Auto Storage Scan Refresh button
+                FilledTonalIconButton(
+                    onClick = onScanStorageClick,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    if (isScanningStorage) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = Color(0xFF005FAC)
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Filled.Sync,
+                            contentDescription = "Auto-Scan Device Storage",
+                            tint = Color(0xFF005FAC),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+
+                // Profile Avatar icon box
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFD3E4FF))
+                        .clickable { onProfileClick() }
+                        .shadow(1.dp, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Person,
+                        contentDescription = "Profile Avatar Options Tracker",
+                        tint = Color(0xFF001C38),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+        }
+
+        // Active Storage Auto-Scanning indicator banner
+        AnimatedVisibility(visible = isScanningStorage) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                color = Color(0xFFE8F0FE),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFF005FAC)
+                    )
+                    Text(
+                        text = "Auto-scanning device storage for PDF files...",
+                        fontSize = 12.sp,
+                        color = Color(0xFF001C38),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
             }
         }
 
@@ -1109,49 +1331,116 @@ fun MainTabletDashboard(
             )
         )
 
-        Spacer(modifier = Modifier.height(20.dp))
+        // Storage Access Prompt Banner if permission not granted
+        if (!hasFullStorageAccess) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                color = Color(0xFFEFF4FA),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, Color(0xFFBFD3EC))
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .background(Color(0xFF005FAC), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.FolderSpecial,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Full Device Storage Access",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = Color(0xFF001D35)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Enable access so PDF Manager can show all PDFs from Downloads, Documents, and WhatsApp.",
+                            fontSize = 11.sp,
+                            color = Color(0xFF44474E),
+                            lineHeight = 14.sp
+                        )
+                    }
+                    Button(
+                        onClick = onRequestStorageAccess,
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF005FAC)),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Text("Grant", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
 
-        // Grid of 4 quick tool actions matching design mockup
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Grid of 4 quick tool actions matching design mockup with fluid responsive weights
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            QuickToolBox(
-                label = "Scan",
-                icon = Icons.Filled.DocumentScanner,
-                bgColor = Color(0xFFD3E4FF),
-                textColor = Color(0xFF001C38),
-                onClick = onScanToolClick
-            )
+            Box(modifier = Modifier.weight(1f)) {
+                QuickToolBox(
+                    label = "Auto-Scan",
+                    icon = Icons.Filled.DocumentScanner,
+                    bgColor = Color(0xFFD3E4FF),
+                    textColor = Color(0xFF001C38),
+                    onClick = onScanStorageClick,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
-            QuickToolBox(
-                label = "Merge",
-                icon = Icons.Filled.MergeType,
-                bgColor = Color(0xFFFFDADA),
-                textColor = Color(0xFF410002),
-                onClick = onMergeToolClick
-            )
+            Box(modifier = Modifier.weight(1f)) {
+                QuickToolBox(
+                    label = "Merge",
+                    icon = Icons.Filled.MergeType,
+                    bgColor = Color(0xFFFFDADA),
+                    textColor = Color(0xFF410002),
+                    onClick = onMergeToolClick,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
-            QuickToolBox(
-                label = "Small",
-                icon = Icons.Filled.Compress,
-                bgColor = Color(0xFFE8DEF8),
-                textColor = Color(0xFF21005D),
-                onClick = onCompressToolClick
-            )
+            Box(modifier = Modifier.weight(1f)) {
+                QuickToolBox(
+                    label = "Small",
+                    icon = Icons.Filled.Compress,
+                    bgColor = Color(0xFFE8DEF8),
+                    textColor = Color(0xFF21005D),
+                    onClick = onCompressToolClick,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
-            QuickToolBox(
-                label = "Protect",
-                icon = Icons.Filled.Lock,
-                bgColor = Color(0xFFC2E7FF),
-                textColor = Color(0xFF001D35),
-                onClick = onProtectToolClick
-            )
+            Box(modifier = Modifier.weight(1f)) {
+                QuickToolBox(
+                    label = "Protect",
+                    icon = Icons.Filled.Lock,
+                    bgColor = Color(0xFFC2E7FF),
+                    textColor = Color(0xFF001D35),
+                    onClick = onProtectToolClick,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
         // Recent Files title bar
         Row(
@@ -1184,7 +1473,7 @@ fun MainTabletDashboard(
                 )
             } else {
                 Text(
-                    text = "View all",
+                    text = "${pdfList.size} file${if (pdfList.size != 1) "s" else ""}",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF005FAC),
@@ -1222,32 +1511,68 @@ fun MainTabletDashboard(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Scrollable sequence
-        if (pdfList.isEmpty()) {
-            EmptyListState(
-                searchQuery = searchQuery,
-                selectedCategory = selectedCategory,
-                starredOnly = starredOnly
-            )
-        } else {
-            LazyColumn(
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 80.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag("pdf_list_lazy_column")
-            ) {
-                items(
-                    items = pdfList,
-                    key = { it.id }
-                ) { pdf ->
-                    PdfItemCard(
-                        pdf = pdf,
-                        onStarToggle = { onStarToggle(pdf) },
-                        onPdfClick = { onPdfClick(pdf) },
-                        onEditClick = { onEditClick(pdf) },
-                        onDeleteClick = { onDeleteClick(pdf) }
-                    )
+        // Responsive scrollable sequence with adaptive layout
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+        ) {
+            val useGrid = maxWidth >= 540.dp
+
+            if (pdfList.isEmpty()) {
+                EmptyListState(
+                    searchQuery = searchQuery,
+                    selectedCategory = selectedCategory,
+                    starredOnly = starredOnly,
+                    isScanning = isScanningStorage,
+                    onScanStorage = onScanStorageClick,
+                    onImportClick = onImportClick,
+                    hasFullStorageAccess = hasFullStorageAccess,
+                    onGrantStorageAccess = onRequestStorageAccess
+                )
+            } else if (useGrid) {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 250.dp),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 80.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("pdf_list_grid")
+                ) {
+                    items(
+                        items = pdfList,
+                        key = { it.id }
+                    ) { pdf ->
+                        PdfItemCard(
+                            pdf = pdf,
+                            onStarToggle = { onStarToggle(pdf) },
+                            onPdfClick = { onPdfClick(pdf) },
+                            onEditClick = { onEditClick(pdf) },
+                            onDeleteClick = { onDeleteClick(pdf) }
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 80.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("pdf_list_lazy_column")
+                ) {
+                    items(
+                        items = pdfList,
+                        key = { it.id }
+                    ) { pdf ->
+                        PdfItemCard(
+                            pdf = pdf,
+                            onStarToggle = { onStarToggle(pdf) },
+                            onPdfClick = { onPdfClick(pdf) },
+                            onEditClick = { onEditClick(pdf) },
+                            onDeleteClick = { onDeleteClick(pdf) }
+                        )
+                    }
                 }
             }
         }
@@ -1263,16 +1588,17 @@ fun QuickToolBox(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     bgColor: Color,
     textColor: Color,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(6.dp),
-        modifier = Modifier.clickable { onClick() }
+        modifier = modifier.clickable { onClick() }
     ) {
         Box(
             modifier = Modifier
-                .size(56.dp)
+                .size(52.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(bgColor),
             contentAlignment = Alignment.Center
@@ -1281,14 +1607,16 @@ fun QuickToolBox(
                 imageVector = icon,
                 contentDescription = null,
                 tint = textColor,
-                modifier = Modifier.size(26.dp)
+                modifier = Modifier.size(24.dp)
             )
         }
         Text(
             text = label,
             fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold,
-            color = Color(0xFF1A1C1E)
+            color = Color(0xFF1A1C1E),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
@@ -1679,7 +2007,7 @@ fun SharedScreenPane(pdfList: List<PdfDocument>, onGenerateLink: (PdfDocument) -
  * Settings tab panel
  */
 @Composable
-fun SettingsScreenPane(pdfList: List<PdfDocument>, context: Context) {
+fun SettingsScreenPane(pdfList: List<PdfDocument>, context: Context, onScanStorage: () -> Unit = {}) {
     val totalSize = pdfList.sumOf { it.sizeInBytes }
     val totalCount = pdfList.size
     val starredCount = pdfList.count { it.isStarred }
@@ -1715,6 +2043,18 @@ fun SettingsScreenPane(pdfList: List<PdfDocument>, context: Context) {
                     Text("Starred Bookmarks", fontSize = 13.sp)
                     Text("$starredCount bookmarks", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
+
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                    onClick = onScanStorage,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF005FAC))
+                ) {
+                    Icon(Icons.Filled.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Auto-Scan Device Storage for PDFs")
+                }
             }
         }
 
@@ -1729,13 +2069,28 @@ fun SettingsScreenPane(pdfList: List<PdfDocument>, context: Context) {
             colors = CardDefaults.outlinedCardColors(containerColor = Color.White),
             border = BorderStroke(1.dp, Color(0xFFE1E2E9))
         ) {
-            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Version: 1.0.3 (Stable)", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Image(
+                        painter = painterResource(id = R.drawable.ic_app_logo),
+                        contentDescription = "PDF Manager Logo",
+                        modifier = Modifier
+                            .size(48.dp)
+                            .shadow(2.dp, CircleShape)
+                    )
+                    Column {
+                        Text("PDF Manager", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1A1C1E))
+                        Text("Version 1.0.4 (Stable Release)", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+                HorizontalDivider(color = Color(0xFFE1E2E9), thickness = 1.dp)
                 Text("Database Engine: SQLite / Room Embedded Architecture", fontSize = 12.sp, color = Color.Gray)
-                Text("Rendering: Native PDF Sandbox Compiling Engine", fontSize = 12.sp, color = Color.Gray)
-                Spacer(modifier = Modifier.height(6.dp))
+                Text("Rendering: Native Android PDF Sandbox Engine", fontSize = 12.sp, color = Color.Gray)
                 Text(
-                    "All visual materials are strictly stored in standard sandboxed memory private to your account files. Disconnect networks in secure locations and run files safely 100% offline.",
+                    "All documents are securely accessed and stored on your device. Fast, safe, private, and 100% offline capable.",
                     fontSize = 11.sp,
                     color = Color.Gray,
                     lineHeight = 15.sp
@@ -1895,7 +2250,12 @@ fun EditMetadataDialog(
 fun EmptyListState(
     searchQuery: String,
     selectedCategory: String,
-    starredOnly: Boolean
+    starredOnly: Boolean,
+    isScanning: Boolean = false,
+    onScanStorage: () -> Unit = {},
+    onImportClick: () -> Unit = {},
+    hasFullStorageAccess: Boolean = true,
+    onGrantStorageAccess: () -> Unit = {}
 ) {
     Box(
         modifier = Modifier
@@ -1907,15 +2267,21 @@ fun EmptyListState(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Icon(
-                imageVector = Icons.Outlined.FindInPage,
-                contentDescription = "No PDF Found Indicator",
-                tint = Color.LightGray,
-                modifier = Modifier.size(80.dp)
+            // Actual Brand Logo Image in Empty State (Circular blue badge)
+            Image(
+                painter = painterResource(id = R.drawable.ic_app_logo),
+                contentDescription = "PDF Manager Logo",
+                modifier = Modifier
+                    .size(88.dp)
+                    .shadow(4.dp, CircleShape)
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "No PDF Documents Found",
+                text = if (!hasFullStorageAccess && searchQuery.isEmpty() && selectedCategory == "All" && !starredOnly) {
+                    "Storage Access Needed"
+                } else {
+                    "No PDF Documents Found"
+                },
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
                 color = Color(0xFF1A1C1E)
@@ -1928,14 +2294,65 @@ fun EmptyListState(
                     "No files categorized as \"$selectedCategory\". Choose a different category tab."
                 } else if (starredOnly) {
                     "No starred PDFs found. Star your favorite files to show them here."
+                } else if (!hasFullStorageAccess) {
+                    "Grant full storage access so PDF Manager can automatically scan and show all your PDF files from Downloads, Documents, & WhatsApp without manual importing."
                 } else {
-                    "No documents imported yet. Tap the '+' button below to safely import your files locally."
+                    "No documents found on device storage. Tap 'Auto-Scan Device' or import a file manually."
                 },
                 textAlign = TextAlign.Center,
                 fontSize = 13.sp,
                 color = Color.Gray,
                 lineHeight = 18.sp
             )
+
+            if (searchQuery.isEmpty() && selectedCategory == "All" && !starredOnly) {
+                Spacer(modifier = Modifier.height(20.dp))
+                if (!hasFullStorageAccess) {
+                    Button(
+                        onClick = onGrantStorageAccess,
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF005FAC))
+                    ) {
+                        Icon(Icons.Filled.FolderSpecial, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Grant Full Storage Access", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = onScanStorage,
+                        enabled = !isScanning,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (hasFullStorageAccess) Color(0xFF005FAC) else Color(0xFF44474E))
+                    ) {
+                        if (isScanning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = Color.White
+                            )
+                        } else {
+                            Icon(Icons.Filled.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Auto-Scan Device")
+                    }
+
+                    OutlinedButton(
+                        onClick = onImportClick,
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Pick File")
+                    }
+                }
+            }
         }
     }
 }
@@ -2325,6 +2742,10 @@ fun PdfReaderPanel(
     onNotesSave: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    BackHandler {
+        onBackClick()
+    }
+
     val context = LocalContext.current
     val pfd = remember(pdf.localPath) { pdfRepository.openFileDescriptor(pdf.localPath) }
     val pdfRenderer = remember(pfd) {

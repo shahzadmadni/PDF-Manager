@@ -17,6 +17,15 @@ interface PdfDao {
     @Query("SELECT * FROM pdf_documents WHERE isStarred = 1 ORDER BY dateAdded DESC")
     fun getStarredPdfs(): Flow<List<PdfDocument>>
 
+    @Query("SELECT * FROM pdf_documents WHERE originalName = :name LIMIT 1")
+    suspend fun getPdfByOriginalName(name: String): PdfDocument?
+
+    @Query("SELECT * FROM pdf_documents WHERE localPath = :path LIMIT 1")
+    suspend fun getPdfByLocalPath(path: String): PdfDocument?
+
+    @Query("SELECT localPath FROM pdf_documents")
+    suspend fun getAllLocalPaths(): List<String>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPdf(pdf: PdfDocument): Long
 

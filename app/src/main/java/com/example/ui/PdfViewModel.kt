@@ -30,6 +30,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _contentMatchedPdfIds = MutableStateFlow<Set<Int>>(emptySet())
     val contentMatchedPdfIds = _contentMatchedPdfIds.asStateFlow()
 
+    // Device storage auto-scan states
+    private val _isScanningStorage = MutableStateFlow(false)
+    val isScanningStorage = _isScanningStorage.asStateFlow()
+
+    private val _scanMessage = MutableStateFlow<String?>(null)
+    val scanMessage = _scanMessage.asStateFlow()
+
     // Import status alerts
     private val _importStatus = MutableStateFlow<ImportState>(ImportState.Idle)
     val importStatus = _importStatus.asStateFlow()
@@ -97,6 +104,23 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+        // Automatically scan device storage on startup
+        scanDeviceStorage()
+    }
+
+    fun scanDeviceStorage() {
+        viewModelScope.launch {
+            if (_isScanningStorage.value) return@launch
+            _isScanningStorage.value = true
+            val count = repository.scanDeviceStorageForPdfs()
+            _isScanningStorage.value = false
+            _scanMessage.value = if (count > 0) "Discovered $count PDF(s) on device storage" else "Storage scan complete"
+        }
+    }
+
+    fun clearScanMessage() {
+        _scanMessage.value = null
     }
 
     fun setSearchQuery(query: String) {
